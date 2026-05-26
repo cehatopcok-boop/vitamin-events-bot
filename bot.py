@@ -22,10 +22,10 @@ def oget(folder, fname):
     except:
         return ""
 
-def history(name):
+def get_history(name):
     out = []
     words = [w for w in name.lower().split() if len(w) > 3]
-    for yr in ["2025","2026"]:
+    for yr in ["2025", "2026"]:
         folder = f"Мероприятия Витамин {yr}"
         req = urllib.request.Request(f"{OURL}/vault/{urllib.parse.quote(folder)}/")
         req.add_header("Authorization", f"Bearer {OTOK}")
@@ -41,41 +41,45 @@ def history(name):
             pass
     return "\n\n".join(out) or "История не найдена."
 
-def docs():
+def get_docs():
     r = oget("Документы которые нужны", "Регламент согласования и оплаты мероприятий.md")
     d = oget("Документы которые нужны", "Отдел ивент-маркетинга Vitamin.tools.md")
     return f"РЕГЛАМЕНТ:\n{r[:2000]}\n\nЦА:\n{d[:1500]}"
 
-def analyze(text):
+def analyze_sync(text):
     lines = [l.strip() for l in text.split("\n") if l.strip()]
-    name = next((re.sub(r'^1[\)\.:\s]+','',l) for l in lines if re.match(r'^1[\)\.]',l)), lines[0] if lines else "мероприятие")
+    name = next((re.sub(r'^1[\)\.:\s]+', '', l) for l in lines if re.match(r'^1[\)\.]', l)), lines[0] if lines else "мероприятие")
     client = anthropic.Anthropic(api_key=AKEY)
     prompt = f"""Ты ивент-аналитик Vitamin.tools. Прими решение по мероприятию.
 
 РЕГЛАМЕНТ И ЦА:
-{docs()}
+{get_docs()}
 
 ИСТОРИЯ:
-{history(name)}
+{get_history(name)}
 
 МЕРОПРИЯТИЕ:
 {text}
 
-Ответь в формате:
-**Мероприятие:** [название]
-**Решение:** УЧАСТВУЕМ / НЕ УЧАСТВУЕМ / НУЖНО УТОЧНИТЬ
-**Аргументы:**
+Ответь строго в формате без markdown звёздочек:
+Мероприятие: [название]
+Решение: УЧАСТВУЕМ / НЕ УЧАСТВУЕМ / НУЖНО УТОЧНИТЬ
+Аргументы:
 - [аргумент про ЦА]
 - [аргумент про бюджет]
 - [аргумент из истории]
-**Расчёт:**
+Расчёт:
 - Стоимость: [сумма]
 - Оценка лидов: [число]
 - Стоимость касания: [сумма]
 - Порог (x1.5): [сумма]
-**История:** [из базы]
-**Что уточнить:** [вопросы]"""
-    msg = client.messages.create(model="claude-sonnet-4-20250514", max_tokens=1500, messages=[{"role":"user","content":prompt}])
+История: [из базы]
+Что уточнить: [вопросы]"""
+    msg = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=1500,
+        messages=[{"role": "user", "content": prompt}]
+    )
     return msg.content[0].text
 
 async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -85,16 +89,21 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     msg = await update.message.reply_text("Анализирую...")
     try:
-        result = await asyncio.get_event_loop().run_in_executor(None, analyze, text)
-        await msg.edit_text(result, parse_mode="Markdown")
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, analyze_sync, text)
+        await msg.edit_text(result[:4000])
     except Exception as e:
-        await msg.edit_text(f"Ошибка: {e}")
+        await msg.edit_text(f"Ошибка: {str(e)[:200]}")
 
-def main():
+async def main():
     app = Application.builder().token(TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
     print("Bot started!")
-    app.run_polling(drop_pending_updates=True)
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(drop_pending_updates=True)
+    print("Polling started, waiting...")
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
