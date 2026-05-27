@@ -6,8 +6,8 @@ import urllib.request
 import urllib.parse
 import re
 import asyncio
-from telegram import Update
-from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes, ConversationHandler
 import anthropic
 
 logging.basicConfig(level=logging.INFO)
@@ -22,29 +22,19 @@ ssl_ctx = ssl.create_default_context()
 ssl_ctx.check_hostname = False
 ssl_ctx.verify_mode = ssl.CERT_NONE
 
-# ── Встроенный регламент (резерв если Obsidian недоступен) ──────────────────
-FALLBACK_REGLAMENT = """
-РЕГЛАМЕНТ VITAMIN.TOOLS — ОТБОР МЕРОПРИЯТИЙ
+# Состояния диалога
+CHOOSING, MODE_HISTORY, MODE_DECISION, MODE_ADVICE = range(4)
 
+FALLBACK_REGLAMENT = """
 ЦА ПРИОРИТЕТ 1: маркетологи и рекламные агентства с бюджетами от 300К+, владельцы бизнеса
 ЦА ПРИОРИТЕТ 2: все бизнесы с рекламными бюджетами от 100К+
 НЕ ИНТЕРЕСНЫ: только SEO/email без платного трафика, недвижимость и банки (оборот >9 млн)
-
-МИНИМУМ АУДИТОРИИ:
-- Офлайн: от 50 чел (от 30 для ЦА-1)
-- Онлайн: от 150 чел (от 50-70 для ЦА-1)
-
-ФОРМУЛА РАСЧЁТА:
-Стоимость участия ÷ потенциальные лиды = стоимость касания
-Средняя стоимость лида × 1.5 = максимально допустимая стоимость лида
-Ориентир: средняя = 1 800 руб., порог = 2 700 руб.
-
-ФОРМАТЫ УЧАСТИЯ: стенд, доклад, спонсорство, партнёрство, нетворкинг
-СПИКЕРЫ: Егор Осипов (Саратов), Ален Багабо (СПб), Денис Кабалкин (только крупные)
+МИНИМУМ: офлайн от 50 чел (от 30 для ЦА-1), онлайн от 150 чел (от 50 для ЦА-1)
+РАСЧЁТ: стоимость касания = стоимость участия / лиды. Порог = 2 700 руб.
 """
 
-# ── Obsidian с коротким таймаутом ────────────────────────────────────────────
-def oget(folder: str, fname: str, timeout: int = 4) -> str:
+# ── Obsidian ─────────────────────────────────────────────────────────────────
+def oget(folder, fname, timeout=4):
     if not OURL:
         return ""
     try:
@@ -54,10 +44,10 @@ def oget(folder: str, fname: str, timeout: int = 4) -> str:
         with urllib.request.urlopen(req, context=ssl_ctx, timeout=timeout) as x:
             return x.read().decode("utf-8")
     except Exception as e:
-        logger.warning(f"oget [{fname}]: {e}")
+        logger.warning(f"oget: {e}")
         return ""
 
-def olist(folder: str, timeout: int = 4) -> list:
+def olist(folder, timeout=4):
     if not OURL:
         return []
     try:
@@ -66,38 +56,59 @@ def olist(folder: str, timeout: int = 4) -> list:
         with urllib.request.urlopen(req, context=ssl_ctx, timeout=timeout) as x:
             return json.loads(x.read()).get("files", [])
     except Exception as e:
-        logger.warning(f"olist [{folder}]: {e}")
+        logger.warning(f"olist: {e}")
         return []
 
-def get_docs() -> str:
+def get_docs():
     r = oget("Документы которые нужны", "Регламент согласования и оплаты мероприятий.md")
     d = oget("Документы которые нужны", "Отдел ивент-маркетинга Vitamin.tools.md")
     if r or d:
-        return f"РЕГЛАМЕНТ:\n{r[:2000]}\n\nЦА И ЗАДАЧИ:\n{d[:1000]}"
+        return f"РЕГЛАМЕНТ:\n{r[:2000]}\n\nЦА:\n{d[:1000]}"
     return FALLBACK_REGLAMENT
 
-def get_history(name: str) -> str:
+def get_history(name):
     words = [w for w in name.lower().split() if len(w) > 3]
     if not words:
         return ""
     out = []
     for yr in ["2026", "2025"]:
         folder = f"Мероприятия Витамин {yr}"
-        files = olist(folder)
-        for f in files:
+        for f in olist(folder):
             if any(w in f.lower() for w in words):
                 c = oget(folder, f)
                 if c:
                     out.append(f"=== {f} ({yr}) ===\n{c[:800]}")
                 if len(out) >= 3:
                     break
-        if len(out) >= 3:
-            break
     return "\n\n".join(out) if out else ""
 
-# ── Основной анализ ──────────────────────────────────────────────────────────
-def analyze_sync(text: str) -> str:
-    # Извлекаем название
+# ── Клод-аналитика ────────────────────────────────────────────────────────────
+def claude_ask(prompt):
+    client = anthropic.Anthropic(api_key=AKEY)
+    msg = client.messages.create(
+        model="claude-sonnet-4-5",
+        max_tokens=2000,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return msg.content[0].text
+
+def analyze_history_sync(query):
+    history = get_history(query)
+    if not history:
+        return f"🔍 В базе Obsidian ничего не нашёл по запросу *{query}*\n\nВозможно мероприятие ещё не добавлено в базу или название отличается. Попробуй другое название."
+    prompt = f"""Ты ивент-аналитик Vitamin.tools. Пользователь хочет узнать всё про мероприятие из нашей базы.
+
+ДАННЫЕ ИЗ БАЗЫ:
+{history}
+
+Структурируй информацию понятно:
+📌 Название и формат
+📅 Когда участвовали
+📊 Результаты и лиды
+💡 Выводы и стоит ли идти снова"""
+    return claude_ask(prompt)
+
+def analyze_decision_sync(text):
     lines = [l.strip() for l in text.split("\n") if l.strip()]
     name = lines[0] if lines else "мероприятие"
     for l in lines:
@@ -110,112 +121,191 @@ def analyze_sync(text: str) -> str:
     history = get_history(name)
     history_block = f"\n\nИСТОРИЯ УЧАСТИЯ:\n{history}" if history else "\n\nИСТОРИЯ: ранее не участвовали или данные недоступны."
 
-    prompt = f"""Ты опытный ивент-маркетолог компании Vitamin.tools (рекламная экосистема: vitamin.tools, yagla.ru, lpgenerator.ru).
-Твоя задача — принять решение об участии в мероприятии на основе регламента компании.
+    prompt = f"""Ты опытный ивент-маркетолог Vitamin.tools. Прими решение об участии в мероприятии.
 
 {docs}
 {history_block}
 
-МЕРОПРИЯТИЕ ДЛЯ АНАЛИЗА:
+МЕРОПРИЯТИЕ:
 {text}
 
-Дай чёткий структурированный ответ:
+Если каких-то данных нет — сделай обоснованное предположение на основе типа мероприятия.
 
+Ответ:
 🎯 *Мероприятие:* [название]
 📅 *Дата и формат:* [дата, город/онлайн]
 
 ✅/❌/⚠️ *Решение:* УЧАСТВУЕМ / НЕ УЧАСТВУЕМ / НУЖНО УТОЧНИТЬ
 
 *Аргументы:*
-• [соответствие ЦА — да/нет, почему]
+• [соответствие ЦА]
 • [охват и аудитория]
 • [бюджетная эффективность]
-• [история участия если есть]
+• [история если есть]
 
 *Расчёт:*
 • Стоимость участия: [X руб.]
 • Потенциальных лидов: [N чел.]
 • Стоимость касания: [X руб.]
-• Порог регламента (×1.5 от 1800₽): 2700₽
-• Вывод по расчёту: [укладывается / не укладывается]
+• Порог (×1.5 от 1800₽): 2700₽
+• Вывод: [укладывается / нет]
 
-*Что уточнить перед финальным решением:*
-• [конкретные вопросы организаторам]
+*Что уточнить:*
+• [вопросы если нужны]
 
-*Рекомендация:* [одно чёткое предложение что делать дальше]"""
+*Рекомендация:* [одно чёткое действие]"""
+    return claude_ask(prompt)
 
-    client = anthropic.Anthropic(api_key=AKEY)
-    msg = client.messages.create(
-        model="claude-sonnet-4-5",
-        max_tokens=1800,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return msg.content[0].text
+def analyze_advice_sync(question):
+    docs = get_docs()
+    prompt = f"""Ты опытный ивент-маркетолог Vitamin.tools. Коллега просит совета.
 
-# ── Telegram handlers ────────────────────────────────────────────────────────
+КОНТЕКСТ КОМПАНИИ:
+{docs}
+
+ВОПРОС:
+{question}
+
+Дай конкретный практичный совет, основанный на опыте ивент-маркетинга."""
+    return claude_ask(prompt)
+
+# ── Handlers ─────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data.clear()
+    keyboard = [["📂 Инфо о прошлом мероприятии"], ["🤔 Принять решение по новому"], ["💡 Просто совет"]]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
     await update.message.reply_text(
-        "👋 Привет! Я Events Brain — помогаю решить, участвовать ли Vitamin.tools в мероприятии.\n\n"
-        "Просто скинь название или ссылку на мероприятие — я сам найду всю информацию в интернете: даты, формат, аудиторию, стоимость, спикеров и всё остальное.\n\n"
-        "Если чего-то не найду — спрошу тебя напрямую. Также могу спросить про наш прошлый опыт участия, если это поможет принять решение.\n\n"
-        "📌 Можно скинуть:\n"
-        "• Просто название: \"Сурового Питерского SMM\"\n"
-        "• Ссылку на сайт мероприятия\n"
-        "• Письмо от организатора целиком\n\n"
-        "Погнали 🎯",
-        parse_mode=None
+        "👋 Привет! Чем займёмся?",
+        reply_markup=reply_markup
     )
+    return CHOOSING
 
-async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📋 *Как пользоваться ботом:*\n\n"
-        "Отправь описание мероприятия — я проверю его по регламенту Vitamin.tools и базе прошлых ивентов.\n\n"
-        "*Что анализирую:*\n"
-        "• Соответствие целевой аудитории\n"
-        "• Стоимость контакта vs регламент\n"
-        "• Историю участия в прошлые годы\n"
-        "• Потенциал лидогенерации\n\n"
-        "*Формат:* можно кидать как угодно — хоть письмо от организатора целиком.",
-        parse_mode="Markdown"
-    )
-
-async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
-        return
+async def choosing(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
-    if len(text) < 15:
-        await update.message.reply_text(
-            "Кинь описание мероприятия — проверю по регламенту. Можно целое письмо от организатора."
-        )
-        return
 
-    status_msg = await update.message.reply_text("🔍 Анализирую мероприятие...")
+    if "прошлом" in text or "📂" in text:
+        await update.message.reply_text(
+            "📂 *Инфо о прошлом мероприятии*\n\n"
+            "Напиши название мероприятия или скинь ссылку — найду всё в нашей базе и структурирую для тебя.",
+            parse_mode="Markdown",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return MODE_HISTORY
+
+    elif "решение" in text or "новому" in text or "🤔" in text:
+        await update.message.reply_text(
+            "🤔 *Принять решение по новому мероприятию*\n\n"
+            "Скинь что есть — хоть письмо от организатора целиком. Если чего-то не хватит, я сам найду в сети.\n\n"
+            "Идеально если есть:\n"
+            "1) Название\n"
+            "2) Дата\n"
+            "3) Формат, город\n"
+            "4) Тематика/треки\n"
+            "5) ЦА, кол-во участников\n"
+            "6) Стоимость участия\n"
+            "7) Сайт\n\n"
+            "Но не парься если чего-то нет — разберёмся 👌",
+            parse_mode="Markdown",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return MODE_DECISION
+
+    elif "совет" in text or "💡" in text:
+        await update.message.reply_text(
+            "💡 *Совет*\n\n"
+            "Что случилось? Расскажи — помогу разобраться.",
+            parse_mode="Markdown",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return MODE_ADVICE
+
+    else:
+        # Если написал что-то другое — пробуем угадать режим
+        keyboard = [["📂 Инфо о прошлом мероприятии"], ["🤔 Принять решение по новому"], ["💡 Просто совет"]]
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+        await update.message.reply_text(
+            "Выбери один из вариантов 👇",
+            reply_markup=reply_markup
+        )
+        return CHOOSING
+
+async def mode_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.message.text.strip()
+    msg = await update.message.reply_text("🔍 Ищу в базе...")
     try:
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, analyze_sync, text)
-        # Разбиваем на части если длинный ответ
-        if len(result) <= 4000:
-            await status_msg.edit_text(result, parse_mode="Markdown")
-        else:
-            await status_msg.delete()
-            chunks = [result[i:i+4000] for i in range(0, len(result), 4000)]
-            for chunk in chunks:
-                await update.message.reply_text(chunk, parse_mode="Markdown")
+        result = await loop.run_in_executor(None, analyze_history_sync, query)
+        await send_long(update, msg, result)
     except Exception as e:
-        logger.error(f"handle error: {e}", exc_info=True)
-        err_text = str(e)
-        if "model" in err_text.lower() and "not_found" in err_text.lower():
-            await status_msg.edit_text("⚠️ Ошибка модели AI. Сообщи Илье.")
-        else:
-            await status_msg.edit_text(f"⚠️ Ошибка при анализе. Попробуй ещё раз или напиши Илье.\n\n{err_text[:200]}")
+        logger.error(f"history error: {e}", exc_info=True)
+        await msg.edit_text("⚠️ Что-то пошло не так. Попробуй ещё раз.")
+    return await ask_continue(update, ctx)
 
-# ── Запуск ───────────────────────────────────────────────────────────────────
+async def mode_decision(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    msg = await update.message.reply_text("🔍 Анализирую мероприятие...")
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, analyze_decision_sync, text)
+        await send_long(update, msg, result)
+    except Exception as e:
+        logger.error(f"decision error: {e}", exc_info=True)
+        await msg.edit_text("⚠️ Что-то пошло не так. Попробуй ещё раз.")
+    return await ask_continue(update, ctx)
+
+async def mode_advice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    question = update.message.text.strip()
+    msg = await update.message.reply_text("💭 Думаю...")
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, analyze_advice_sync, question)
+        await send_long(update, msg, result)
+    except Exception as e:
+        logger.error(f"advice error: {e}", exc_info=True)
+        await msg.edit_text("⚠️ Что-то пошло не так. Попробуй ещё раз.")
+    return await ask_continue(update, ctx)
+
+async def send_long(update, msg, text):
+    if len(text) <= 4000:
+        try:
+            await msg.edit_text(text, parse_mode="Markdown")
+        except Exception:
+            await msg.edit_text(text)
+    else:
+        await msg.delete()
+        for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
+            try:
+                await update.message.reply_text(chunk, parse_mode="Markdown")
+            except Exception:
+                await update.message.reply_text(chunk)
+
+async def ask_continue(update, ctx):
+    keyboard = [["📂 Инфо о прошлом мероприятии"], ["🤔 Принять решение по новому"], ["💡 Просто совет"]]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+    await update.message.reply_text("Чем ещё помочь?", reply_markup=reply_markup)
+    return CHOOSING
+
+async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await cmd_start(update, ctx)
+    return CHOOSING
+
+# ── Запуск ────────────────────────────────────────────────────────────────────
 def main():
     logger.info("Starting Events Brain bot...")
     app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
+
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("start", cmd_start)],
+        states={
+            CHOOSING:      [MessageHandler(filters.TEXT & ~filters.COMMAND, choosing)],
+            MODE_HISTORY:  [MessageHandler(filters.TEXT & ~filters.COMMAND, mode_history)],
+            MODE_DECISION: [MessageHandler(filters.TEXT & ~filters.COMMAND, mode_decision)],
+            MODE_ADVICE:   [MessageHandler(filters.TEXT & ~filters.COMMAND, mode_advice)],
+        },
+        fallbacks=[CommandHandler("start", cmd_start), CommandHandler("cancel", cancel)],
+        allow_reentry=True,
+    )
+    app.add_handler(conv)
     logger.info("Bot is running...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
