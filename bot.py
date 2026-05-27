@@ -1,25 +1,37 @@
-import os, asyncio, json, ssl, urllib.request, urllib.parse, re
+import os
+import logging
+import json
+import ssl
+import urllib.request
+import urllib.parse
+import re
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 import anthropic
 
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-AKEY = os.getenv("ANTHROPIC_API_KEY")
-OURL = os.getenv("OBSIDIAN_URL", "").rstrip("/")
-OTOK = os.getenv("OBSIDIAN_TOKEN")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+TOKEN = os.environ["TELEGRAM_TOKEN"]
+AKEY = os.environ["ANTHROPIC_API_KEY"]
+OURL = os.environ.get("OBSIDIAN_URL", "").rstrip("/")
+OTOK = os.environ.get("OBSIDIAN_TOKEN", "")
 
 ssl_ctx = ssl.create_default_context()
 ssl_ctx.check_hostname = False
 ssl_ctx.verify_mode = ssl.CERT_NONE
 
 def oget(folder, fname):
-    url = f"{OURL}/vault/{urllib.parse.quote(folder)}/{urllib.parse.quote(fname)}"
-    req = urllib.request.Request(url)
-    req.add_header("Authorization", f"Bearer {OTOK}")
     try:
+        url = f"{OURL}/vault/{urllib.parse.quote(folder)}/{urllib.parse.quote(fname)}"
+        req = urllib.request.Request(url)
+        req.add_header("Authorization", f"Bearer {OTOK}")
         with urllib.request.urlopen(req, context=ssl_ctx, timeout=10) as x:
             return x.read().decode("utf-8")
-    except:
+    except Exception as e:
+        logger.error(f"oget error: {e}")
         return ""
 
 def get_history(name):
@@ -27,28 +39,32 @@ def get_history(name):
     words = [w for w in name.lower().split() if len(w) > 3]
     for yr in ["2025", "2026"]:
         folder = f"Мероприятия Витамин {yr}"
-        req = urllib.request.Request(f"{OURL}/vault/{urllib.parse.quote(folder)}/")
-        req.add_header("Authorization", f"Bearer {OTOK}")
         try:
+            req = urllib.request.Request(f"{OURL}/vault/{urllib.parse.quote(folder)}/")
+            req.add_header("Authorization", f"Bearer {OTOK}")
             with urllib.request.urlopen(req, context=ssl_ctx, timeout=10) as x:
                 files = json.loads(x.read()).get("files", [])
             for f in files:
                 if any(w in f.lower() for w in words):
                     c = oget(folder, f)
                     if c:
-                        out.append(f"=== {f} ({yr}) ===\n{c[:1200]}")
-        except:
-            pass
+                        out.append(f"=== {f} ({yr}) ===\n{c[:1000]}")
+        except Exception as e:
+            logger.error(f"history error {yr}: {e}")
     return "\n\n".join(out) or "История не найдена."
 
 def get_docs():
     r = oget("Документы которые нужны", "Регламент согласования и оплаты мероприятий.md")
     d = oget("Документы которые нужны", "Отдел ивент-маркетинга Vitamin.tools.md")
-    return f"РЕГЛАМЕНТ:\n{r[:2000]}\n\nЦА:\n{d[:1500]}"
+    return f"РЕГЛАМЕНТ:\n{r[:1500]}\n\nЦА:\n{d[:1000]}"
 
 def analyze_sync(text):
     lines = [l.strip() for l in text.split("\n") if l.strip()]
-    name = next((re.sub(r'^1[\)\.:\s]+', '', l) for l in lines if re.match(r'^1[\)\.]', l)), lines[0] if lines else "мероприятие")
+    name = lines[0] if lines else "мероприятие"
+    for l in lines:
+        if re.match(r'^1[\)\.]', l):
+            name = re.sub(r'^1[\)\.\s]+', '', l).strip()
+            break
     client = anthropic.Anthropic(api_key=AKEY)
     prompt = f"""Ты ивент-аналитик Vitamin.tools. Прими решение по мероприятию.
 
@@ -61,19 +77,19 @@ def analyze_sync(text):
 МЕРОПРИЯТИЕ:
 {text}
 
-Ответь строго в формате без markdown звёздочек:
+Ответь кратко:
 Мероприятие: [название]
 Решение: УЧАСТВУЕМ / НЕ УЧАСТВУЕМ / НУЖНО УТОЧНИТЬ
 Аргументы:
-- [аргумент про ЦА]
-- [аргумент про бюджет]
-- [аргумент из истории]
+- [про ЦА]
+- [про бюджет/охват]
+- [из истории]
 Расчёт:
-- Стоимость: [сумма]
+- Стоимость участия: [сумма]
 - Оценка лидов: [число]
 - Стоимость касания: [сумма]
-- Порог (x1.5): [сумма]
-История: [из базы]
+- Порог регламента x1.5: [сумма]
+История: [что было раньше]
 Что уточнить: [вопросы]"""
     msg = client.messages.create(
         model="claude-sonnet-4-20250514",
@@ -89,21 +105,19 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     msg = await update.message.reply_text("Анализирую...")
     try:
-        loop = asyncio.get_event_loop()
+        loop = __import__('asyncio').get_event_loop()
         result = await loop.run_in_executor(None, analyze_sync, text)
         await msg.edit_text(result[:4000])
     except Exception as e:
-        await msg.edit_text(f"Ошибка: {str(e)[:200]}")
+        logger.error(f"handle error: {e}")
+        await msg.edit_text(f"Ошибка: {str(e)[:300]}")
 
-async def main():
+def main():
+    logger.info("Starting bot...")
     app = Application.builder().token(TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
-    print("Bot started!")
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling(drop_pending_updates=True)
-    print("Polling started, waiting...")
-    await asyncio.Event().wait()
+    logger.info("Running polling...")
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
